@@ -1,0 +1,6 @@
+.vs/
+obj/
+bin/
+resources
+src/Shared/Network/Generated/
+cache

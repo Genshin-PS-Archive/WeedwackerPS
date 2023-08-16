@@ -1,0 +1,188 @@
+﻿using MongoDB.Bson.Serialization.Attributes;
+using MongoDB.Driver;
+using Weedwacker.GameServer.Data;
+using Weedwacker.GameServer.Data.Enums;
+using Weedwacker.GameServer.Database;
+using Weedwacker.GameServer.Packet.Send;
+using Weedwacker.Shared.Utils;
+
+namespace Weedwacker.GameServer.Systems.Inventory
+{
+    internal class RelicTab : InventoryTab
+    {
+        [BsonIgnore] public new const int InventoryLimit = 1500;
+        private static readonly string mongoPathToItems = $"{nameof(InventoryManager.SubInventories)}.{ItemType.ITEM_RELIQUARY}";
+        [BsonElement] private uint NextRelicId = 0; // Is it possible to collect 4B items? O.o
+        // Use Mongodb unique (for the player) id for the relics
+        [BsonSerializer(typeof(UIntDictionarySerializer<MaterialItem>))]
+        public Dictionary<uint, MaterialItem> UpgradeMaterials = new();
+
+        public RelicTab(Player.Player owner, InventoryManager inventory) : base(owner, inventory) { }
+
+        public override async Task OnLoadAsync(Player.Player owner, InventoryManager inventory)
+        {
+            Owner = owner;
+            Inventory = inventory;
+            foreach (ReliquaryItem item in Items.Values)
+            {
+                item.Guid = Owner.GetNextGameGuid();
+                if (item.EquippedAvatar != 0) await inventory.EquipRelic(owner.Avatars.Avatars[item.EquippedAvatar].Guid, item.Guid);
+            }
+            foreach (MaterialItem item in UpgradeMaterials.Values)
+            {
+                item.Guid = Owner.GetNextGameGuid();
+            }
+        }
+
+        public override async Task<GameItem?> AddItemAsync(uint itemId, uint count = 1, uint level = 1, uint refinement = 0)
+        {
+            if (GameData.ItemDataMap[itemId].itemType == ItemType.ITEM_MATERIAL)
+            {
+                if (UpgradeMaterials.TryGetValue(itemId, out MaterialItem material))
+                {
+                    if (material.ItemData.stackLimit >= material.Count + count)
+                    {
+                        material.Count += count;
+
+
+                        // Update Database
+                        FilterDefinition<InventoryManager>? filter = Builders<InventoryManager>.Filter.Where(w => w.OwnerId == Owner.GameUid);
+                        UpdateDefinition<InventoryManager>? update = Builders<InventoryManager>.Update.Set($"{mongoPathToItems}.{nameof(UpgradeMaterials)}.{itemId}.{nameof(GameItem.Count)}", material.Count);
+                        await DatabaseManager.UpdateInventoryAsync(filter, update);
+
+                        //TODO update codex
+                        return material;
+                    }
+                    else return null;
+                }
+                else
+                {
+                    MaterialItem? newMaterial = new(Owner.GetNextGameGuid(), itemId, count);
+                    UpgradeMaterials.Add(itemId, newMaterial);
+
+                    // Update Database
+                    FilterDefinition<InventoryManager>? filter = Builders<InventoryManager>.Filter.Where(w => w.OwnerId == Owner.GameUid);
+                    UpdateDefinition<InventoryManager>? update = Builders<InventoryManager>.Update.Set($"{mongoPathToItems}.{nameof(UpgradeMaterials)}.{itemId}", newMaterial);
+                    await DatabaseManager.UpdateInventoryAsync(filter, update);
+
+                    //TODO update codex
+                    return newMaterial;
+                }
+            }
+
+            if (Items.Count == InventoryLimit)
+            {
+                return null;
+            }
+
+            ReliquaryItem? relic = new(Owner.GetNextGameGuid(), itemId, NextRelicId++, level);
+            Items.Add(relic.Id, relic);
+
+            // Update Database
+            FilterDefinition<InventoryManager>? filter2 = Builders<InventoryManager>.Filter.Where(w => w.OwnerId == Owner.GameUid);
+            UpdateDefinition<InventoryManager>? update2 = Builders<InventoryManager>.Update.Set($"{mongoPathToItems}.{nameof(Items)}.{relic.Id}", relic).Inc($"{mongoPathToItems}.{nameof(NextRelicId)}", 1);
+            await DatabaseManager.UpdateInventoryAsync(filter2, update2);
+
+            //TODO update codex
+            return relic;
+        }
+
+        internal override async Task<bool> RemoveItemAsync(GameItem item, uint count = 1)
+        {
+            if (Items.TryGetValue((item as ReliquaryItem).Id, out GameItem? relic))
+            {
+                if ((relic as ReliquaryItem).EquippedAvatar != 0)
+                {
+                    await Owner.Avatars.Avatars[(relic as ReliquaryItem).EquippedAvatar].UnequipRelic((relic as ReliquaryItem).ItemData.equipType);
+                }
+
+                // Update Database
+                FilterDefinition<InventoryManager>? filter2 = Builders<InventoryManager>.Filter.Where(w => w.OwnerId == Owner.GameUid);
+                UpdateDefinition<InventoryManager>? update2 = Builders<InventoryManager>.Update.Unset($"{mongoPathToItems}.{nameof(Items)}.{relic.Id}");
+                await DatabaseManager.UpdateInventoryAsync(filter2, update2);
+
+                Items.Remove((relic as ReliquaryItem).Id);
+                Inventory.GuidMap.Remove(relic.Guid);
+                relic.Count = 0;
+                await Owner.SendPacketAsync(new PacketStoreItemDelNotify(relic));
+                return true;
+            }
+            else if (UpgradeMaterials.TryGetValue((item as MaterialItem).ItemId, out MaterialItem material))
+            {
+                if (material.Count - count >= 1)
+                {
+                    material.Count -= count;
+
+                    // Update Database
+                    FilterDefinition<InventoryManager>? filter2 = Builders<InventoryManager>.Filter.Where(w => w.OwnerId == Owner.GameUid);
+                    UpdateDefinition<InventoryManager>? update2 = Builders<InventoryManager>.Update.Set($"{mongoPathToItems}.{nameof(UpgradeMaterials)}.{material.ItemId}.{nameof(GameItem.Count)}", material.Count);
+                    await DatabaseManager.UpdateInventoryAsync(filter2, update2);
+
+                    await Owner.SendPacketAsync(new PacketStoreItemChangeNotify(material));
+                    return true;
+                }
+                else if (material.Count - count == 0)
+                {
+                    // Update Database
+                    FilterDefinition<InventoryManager>? filter2 = Builders<InventoryManager>.Filter.Where(w => w.OwnerId == Owner.GameUid);
+                    UpdateDefinition<InventoryManager>? update2 = Builders<InventoryManager>.Update.Unset($"{mongoPathToItems}.{nameof(Items)}.{material.ItemId}");
+                    await DatabaseManager.UpdateInventoryAsync(filter2, update2);
+                  
+                    UpgradeMaterials.Remove(material.ItemId);
+                    material.Count = 0;
+                    Inventory.GuidMap.Remove(material.Guid);
+                    await Owner.SendPacketAsync(new PacketStoreItemDelNotify(material));
+                    return true;
+                }
+                else
+                {
+                    Logger.WriteErrorLine("ItemId: " + item.ItemId + ". Tried to remove " + count + " have " + item.Count);
+                    return false;
+                }
+            }
+            else
+            {
+                Logger.WriteErrorLine("Tried to remove inexistent item");
+                return false;
+            }
+        }
+
+        public async Task<bool> EquipRelic(ulong avatarGuid, ulong equipGuid)
+        {
+            Avatar.Avatar? avatar = Owner.Avatars.GetAvatarByGuid(avatarGuid);
+
+            if (avatar != null && Inventory.GuidMap.TryGetValue(equipGuid, out GameItem relic) && relic.ItemData.itemType == ItemType.ITEM_RELIQUARY)
+            {
+                ReliquaryItem asRelic = (ReliquaryItem)relic;
+                // Is it equipped ot another avatar?
+                Avatar.Avatar? otherAvatar = Owner.Avatars.Avatars.Values.Where(a => a.GetRelic(asRelic.ItemData.equipType) == asRelic && a != avatar).FirstOrDefault();
+                if (otherAvatar != null)
+                {
+                    await UnequipRelicAsync(otherAvatar.Guid, asRelic.ItemData.equipType);
+                }
+
+                if (await avatar.EquipRelic(asRelic, true))
+                {
+                    asRelic.EquippedAvatar = avatar.AvatarId;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        public async Task<bool> UnequipRelicAsync(ulong avatarGuid, EquipType slot)
+        {
+            Avatar.Avatar? avatar = Owner.Avatars.GetAvatarByGuid(avatarGuid);
+
+            if (avatar != null && slot != EquipType.EQUIP_WEAPON)
+            {
+
+                return await avatar.UnequipRelic(slot);
+
+            }
+
+            return false;
+        }
+    }
+}
